@@ -1336,6 +1336,21 @@ def test_retry_with():
         with_retry(FailerUntil(3).__call__)()
 
 
+@pytest.mark.parametrize("max_attempts", [0, -1])
+def test_max_attempts_below_one_is_rejected(max_attempts):
+    """A single attempt is the minimum; fewer used to fail with an UnboundLocalError
+    on the first request instead of being reported where the value was set.
+    """
+    with pytest.raises(ValueError, match="max_attempts must be at least 1"):
+        TrinoRequest(
+            host="coordinator",
+            port=constants.DEFAULT_TLS_PORT,
+            client_session=ClientSession(user="test"),
+            http_scheme=constants.HTTPS,
+            max_attempts=max_attempts,
+        )
+
+
 def assert_headers_with_roles(headers: Dict[str, str], roles: Optional[str]):
     if roles is None:
         assert constants.HEADER_ROLE not in headers
@@ -1752,3 +1767,43 @@ def test_execute_drains_spooled_update_query_with_trailing_page():
     assert query.stats["state"] == "FINISHED"
     # The count row survives draining and the rows stay lazily iterable.
     assert list(result) == [[3]]
+
+
+@httprettified
+def test_execute_on_a_cancelled_query_reports_the_cancellation():
+    """Re-executing a cancelled TrinoQuery must fail with a readable TrinoUserError."""
+    query_id = "20210817_140827_00000_arvdv"
+    statement_path = f"{SERVER_ADDRESS}{constants.URL_STATEMENT_PATH}"
+    next_uri = f"{statement_path}/{query_id}/1"
+
+    post_response = {
+        "id": query_id,
+        "nextUri": next_uri,
+        "infoUri": f"{SERVER_ADDRESS}/query.html?{query_id}",
+        "columns": [{
+            "name": "x",
+            "type": "bigint",
+            "typeSignature": {"rawType": "bigint", "arguments": [], "typeArguments": []},
+        }],
+        "data": [[1]],
+        "stats": {"state": "RUNNING"},
+    }
+
+    httpretty.register_uri(method=httpretty.POST, uri=statement_path, body=json.dumps(post_response))
+    httpretty.register_uri(method=httpretty.DELETE, uri=next_uri, status=204)
+
+    request = TrinoRequest(
+        host="coordinator",
+        port=constants.DEFAULT_TLS_PORT,
+        client_session=ClientSession(user="test"),
+        http_scheme=constants.HTTPS,
+    )
+    query = TrinoQuery(request, query="SELECT x FROM some_table")
+
+    query.execute()
+    query.cancel()
+    assert query.cancelled is True
+
+    with pytest.raises(trino.exceptions.TrinoUserError, match="Query has been cancelled") as exception_info:
+        query.execute()
+    assert exception_info.value.query_id == query_id

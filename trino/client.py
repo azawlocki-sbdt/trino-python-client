@@ -48,6 +48,8 @@ import urllib.parse
 import warnings
 from abc import abstractmethod
 from collections.abc import Iterator
+from collections.abc import Mapping
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
@@ -61,7 +63,9 @@ from typing import Dict
 from typing import List
 from typing import Literal
 from typing import Optional
+from typing import Protocol
 from typing import Tuple
+from typing import TYPE_CHECKING
 from typing import TypedDict
 from typing import Union
 from zoneinfo import ZoneInfo
@@ -69,14 +73,19 @@ from zoneinfo import ZoneInfo
 try:
     import lz4.block
 except ImportError as err:
-    _LZ4_ERROR = str(err)
+    _LZ4_ERROR: Optional[str] = str(err)
 else:
     _LZ4_ERROR = None
 
-try:
-    import orjson as json
-except ImportError:
+if TYPE_CHECKING:
+    # orjson has no stubs and is API-compatible with the standard library for
+    # the loads() calls made here, so type checking goes against json.
     import json
+else:
+    try:
+        import orjson as json
+    except ImportError:
+        import json
 
 import requests
 from requests import Response
@@ -86,7 +95,7 @@ from requests.structures import CaseInsensitiveDict
 try:
     import zstandard
 except ImportError as err:
-    _ZSTD_ERROR = str(err)
+    _ZSTD_ERROR: Optional[str] = str(err)
 else:
     _ZSTD_ERROR = None
 
@@ -99,6 +108,7 @@ from trino.auth import Authentication
 from trino.exceptions import TrinoExternalError
 from trino.exceptions import TrinoQueryError
 from trino.exceptions import TrinoUserError
+from trino.mapper import NoOpRowMapper
 from trino.mapper import RowMapper
 from trino.mapper import RowMapperFactory
 
@@ -114,11 +124,22 @@ __all__ = [
     "Segment"
 ]
 
+_AnyRowMapper = Union[RowMapper, NoOpRowMapper]
+
+if TYPE_CHECKING:
+    # ParamSpec is defined in Python >=3.10, so the module won't type check with older versions
+    from typing import ParamSpec
+    from typing import TypeVar
+
+    # Type vars for _retry_with and RetryHandler
+    _P = ParamSpec("_P")
+    _R = TypeVar("_R", bound=Response)
+
 logger = trino.logging.get_logger(__name__)
 executor = ThreadPoolExecutor(max_workers=4)
 
 
-def close_executor():
+def close_executor() -> None:
     executor.shutdown(wait=True)
 
 
@@ -182,17 +203,17 @@ class ClientSession:
 
     def __init__(
         self,
-        user: str,
+        user: Optional[str],
         authorization_user: Optional[str] = None,
         catalog: Optional[str] = None,
         schema: Optional[str] = None,
         source: Optional[str] = None,
         properties: Optional[Dict[str, str]] = None,
-        headers: Optional[Dict[str, str]] = None,
+        headers: Optional[Dict[str, Union[str, bytes]]] = None,
         transaction_id: Optional[str] = None,
-        extra_credential: Optional[List[Tuple[str, str]]] = None,
-        client_tags: Optional[List[str]] = None,
-        roles: Optional[Union[Dict[str, str], str]] = None,
+        extra_credential: Optional[Sequence[Tuple[str, str]]] = None,
+        client_tags: Optional[Sequence[str]] = None,
+        roles: Optional[Union[Mapping[str, str], str]] = None,
         timezone: Optional[str] = None,
         encoding: Optional[Union[str, List[str]]] = None,
         heartbeat_interval: Optional[float] = constants.DEFAULT_HEARTBEAT_INTERVAL,
@@ -209,7 +230,7 @@ class ClientSession:
         self._headers = headers.copy() if headers is not None else {}
         self._transaction_id = transaction_id
         self._extra_credential = extra_credential
-        self._client_tags = client_tags.copy() if client_tags is not None else list()
+        self._client_tags = list(client_tags) if client_tags is not None else []
         self._roles = self._format_roles(roles) if roles is not None else {}
         if timezone:  # Check timezone validity
             ZoneInfo(timezone)
@@ -221,7 +242,7 @@ class ClientSession:
         self._heartbeat_interval = heartbeat_interval
 
     @property
-    def user(self) -> str:
+    def user(self) -> Optional[str]:
         return self._user
 
     @property
@@ -269,7 +290,7 @@ class ClientSession:
             self._properties = properties
 
     @property
-    def headers(self) -> Dict[str, str]:
+    def headers(self) -> Dict[str, Union[str, bytes]]:
         return self._headers
 
     @property
@@ -283,7 +304,7 @@ class ClientSession:
             self._transaction_id = transaction_id
 
     @property
-    def extra_credential(self) -> Optional[List[Tuple[str, str]]]:
+    def extra_credential(self) -> Optional[Sequence[Tuple[str, str]]]:
         return self._extra_credential
 
     @property
@@ -324,7 +345,7 @@ class ClientSession:
         return self._heartbeat_interval
 
     @staticmethod
-    def _format_roles(roles: Union[Dict[str, str], str]) -> Dict[str, str]:
+    def _format_roles(roles: Union[Mapping[str, str], str]) -> Dict[str, str]:
         if isinstance(roles, str):
             roles = {"system": roles}
         formatted_roles = {}
@@ -341,12 +362,12 @@ class ClientSession:
                 formatted_roles[catalog] = f"ROLE{{{role}}}"
         return formatted_roles
 
-    def __getstate__(self):
+    def __getstate__(self) -> Dict[str, Any]:
         state = self.__dict__.copy()
         del state["_object_lock"]
         return state
 
-    def __setstate__(self, state):
+    def __setstate__(self, state: Dict[str, Any]) -> None:
         self.__dict__.update(state)
         self._object_lock = threading.Lock()
 
@@ -391,7 +412,7 @@ class TrinoStatus:
     rows: Union[List[Any], Dict[str, Any]]
     columns: List[Any]
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return (
             "TrinoStatus("
             "id={}, stats={{...}}, warnings={}, info_uri={}, next_uri={}, rows=<count={}>"
@@ -407,14 +428,18 @@ class TrinoStatus:
 
 class _DelayExponential:
     def __init__(
-            self, base=0.1, exponent=2, jitter=True, max_delay=1800  # 100ms  # 30 min
-    ):
+            self,
+            base: float = 0.1,  # 100ms
+            exponent: float = 2,
+            jitter: bool = True,
+            max_delay: float = 1800,  # 30 min
+    ) -> None:
         self._base = base
         self._exponent = exponent
         self._jitter = jitter
         self._max_delay = max_delay
 
-    def __call__(self, attempt):
+    def __call__(self, attempt: int) -> float:
         delay = float(self._base) * (self._exponent ** attempt)
         if self._jitter:
             delay *= random.random()
@@ -422,22 +447,46 @@ class _DelayExponential:
         return delay
 
 
-class _RetryWithExponentialBackoff:
+class RetryHandler(Protocol):
+
+    def retry(
+        self,
+        func: Callable[_P, Response],
+        args: _P.args,
+        kwargs: _P.kwargs,
+        err: Optional[BaseException],
+        attempt: int,
+    ) -> None:
+        """Sleep before the next attempt.
+
+        Called with the function being retried, the arguments it was called with, the exception that triggered
+        the retry (`None` when the retry was triggered by the response) and the number of the attempt that just failed.
+        """
+        ...
+
+
+class _RetryWithExponentialBackoff(RetryHandler):
     def __init__(
-            self, base=0.1, exponent=2, jitter=True, max_delay=1800  # 100ms  # 30 min
-    ):
+            self,
+            base: float = 0.1,  # 100ms
+            exponent: float = 2,
+            jitter: bool = True,
+            max_delay: float = 1800,  # 30 min
+    ) -> None:
         self._get_delay = _DelayExponential(base, exponent, jitter, max_delay)
 
-    def retry(self, func, args, kwargs, err, attempt):
+    def retry(
+        self, func: object, args: object, kwargs: object, err: object, attempt: int
+    ) -> None:
         delay = self._get_delay(attempt)
         sleep(delay)
 
 
 class _RetryAfterSleep:
-    def __init__(self, retry_after_header):
+    def __init__(self, retry_after_header: float) -> None:
         self._retry_after_header = retry_after_header
 
-    def retry(self):
+    def retry(self) -> None:
         sleep(self._retry_after_header)
 
 
@@ -499,8 +548,8 @@ class TrinoRequest:
         auth: Optional[Authentication] = constants.DEFAULT_AUTH,
         max_attempts: int = MAX_ATTEMPTS,
         request_timeout: Union[float, Tuple[float, float]] = constants.DEFAULT_REQUEST_TIMEOUT,
-        handle_retry=_RetryWithExponentialBackoff(),
-        verify: bool = True,
+        handle_retry: RetryHandler = _RetryWithExponentialBackoff(),
+        verify: Optional[Union[bool, str]] = True,
     ) -> None:
         self._client_session = client_session
         self._host = host
@@ -540,8 +589,9 @@ class TrinoRequest:
         self._client_session.transaction_id = value
 
     @property
-    def http_headers(self) -> CaseInsensitiveDict[str]:
-        headers: CaseInsensitiveDict[str] = CaseInsensitiveDict()
+    def http_headers(self) -> CaseInsensitiveDict[Any]:
+        # A None value means "do not send this header"; requests drops those.
+        headers: CaseInsensitiveDict[Any] = CaseInsensitiveDict()
 
         headers[constants.HEADER_CATALOG] = self._client_session.catalog
         headers[constants.HEADER_SCHEMA] = self._client_session.schema
@@ -618,7 +668,7 @@ class TrinoRequest:
 
         return headers
 
-    def unauthenticated(self):
+    def unauthenticated(self) -> TrinoRequest:
         return TrinoRequest(
             host=self._host,
             port=self._port,
@@ -715,7 +765,9 @@ class TrinoRequest:
         )
 
     @staticmethod
-    def _process_error(error, query_id: Optional[str]) -> Union[TrinoExternalError, TrinoQueryError, TrinoUserError]:
+    def _process_error(
+        error: Dict[str, Any], query_id: Optional[str]
+    ) -> Union[TrinoExternalError, TrinoQueryError, TrinoUserError]:
         error_type = error["errorType"]
         if error_type == "EXTERNAL":
             raise exceptions.TrinoExternalError(error, query_id)
@@ -738,7 +790,7 @@ class TrinoRequest:
         raise exceptions.HttpError(
             "error {}{}".format(
                 http_response.status_code,
-                ": {}".format(http_response.content) if http_response.content else "",
+                ": {!r}".format(http_response.content) if http_response.content else "",
             )
         )
 
@@ -842,10 +894,11 @@ class TrinoResult:
     failure happened instead of silently dropping the remaining rows.
     """
 
-    def __init__(self, query, rows: List[Any]):
+    def __init__(self, query: TrinoQuery, rows: Any) -> None:
         self._query = query
-        # Initial rows from the first POST request
-        self._rows = rows
+        # Initial rows from the first POST request. Depending on the protocol these
+        # are a list, a lazy iterator over spooled segments, or None once exhausted.
+        self._rows: Any = rows
         self._rownumber = 0
         # Iterator over the batch of rows currently being served
         self._current_batch: Optional[Iterator[Any]] = None
@@ -853,21 +906,21 @@ class TrinoResult:
         self._next_rows: Optional[Any] = None
 
     @property
-    def rows(self):
+    def rows(self) -> Any:
         return self._rows
 
     @rows.setter
-    def rows(self, rows):
+    def rows(self, rows: Any) -> None:
         self._rows = rows
 
     @property
     def rownumber(self) -> int:
         return self._rownumber
 
-    def __iter__(self):
+    def __iter__(self) -> TrinoResult:
         return self
 
-    def __next__(self):
+    def __next__(self) -> Any:
         while True:
             if self._current_batch is None:
                 if self._query.finished and self._rows is None:
@@ -904,17 +957,17 @@ class TrinoQuery:
         self._stats: Dict[Any, Any] = {}
         self._info_uri: Optional[str] = None
         self._warnings: List[Dict[Any, Any]] = []
-        self._columns: Optional[List[str]] = None
+        self._columns: Optional[List[Dict[str, Any]]] = None
         self._finished = False
         self._cancelled = False
         self._request = request
-        self._update_type = None
-        self._update_count = None
-        self._next_uri = None
+        self._update_type: Optional[str] = None
+        self._update_count: Optional[int] = None
+        self._next_uri: Optional[str] = None
         self._query = query
         self._result: Optional[TrinoResult] = None
         self._legacy_primitive_types = legacy_primitive_types
-        self._row_mapper: Optional[RowMapper] = None
+        self._row_mapper: Optional[_AnyRowMapper] = None
         self._fetch_mode = fetch_mode
         self._stats_callback = stats_callback
 
@@ -927,8 +980,10 @@ class TrinoQuery:
         return self._query
 
     @property
-    def columns(self):
-        if self.query_id:
+    def columns(self) -> Optional[List[Dict[str, Any]]]:
+        # execute() sets the query id and the result together.
+        if self.query_id and self._result is not None:
+            result = self._result
             while not self._columns and not self.finished and not self.cancelled:
                 # Columns are not returned immediately after query is submitted.
                 # Continue fetching data until columns information is available and push fetched rows into buffer.
@@ -939,41 +994,41 @@ class TrinoQuery:
                 #    because we cannot cheaply check iterator length.
                 new_rows = self.fetch()
                 if isinstance(new_rows, list):
-                    self._result.rows += new_rows
+                    result.rows += new_rows
                 else:
                     try:
                         first_row = next(new_rows)
-                        self._result.rows = itertools.chain([first_row], new_rows)
+                        result.rows = itertools.chain([first_row], new_rows)
                         break
                     except StopIteration:
-                        self._result.rows = []
+                        result.rows = []
         return self._columns
 
     @property
-    def stats(self):
+    def stats(self) -> Dict[Any, Any]:
         return self._stats
 
     @property
-    def update_type(self):
+    def update_type(self) -> Optional[str]:
         return self._update_type
 
     @property
-    def update_count(self):
+    def update_count(self) -> Optional[int]:
         return self._update_count
 
     @property
-    def warnings(self):
+    def warnings(self) -> List[Dict[Any, Any]]:
         return self._warnings
 
     @property
-    def result(self):
+    def result(self) -> Optional[TrinoResult]:
         return self._result
 
     @property
-    def info_uri(self):
+    def info_uri(self) -> Optional[str]:
         return self._info_uri
 
-    def execute(self, additional_http_headers=None) -> TrinoResult:
+    def execute(self, additional_http_headers: Optional[Dict[str, Any]] = None) -> TrinoResult:
         """Initiate a Trino query by sending the SQL statement
 
         This is the first HTTP request sent to the coordinator.
@@ -982,7 +1037,7 @@ class TrinoQuery:
         call fetch() until finished is true.
         """
         if self.cancelled:
-            raise exceptions.TrinoUserError("Query has been cancelled", self.query_id)
+            raise exceptions.TrinoUserError({"message": "Query has been cancelled"}, self.query_id)
 
         try:
             response = self._request.post(self._query, additional_http_headers)
@@ -997,7 +1052,7 @@ class TrinoQuery:
         if status.next_uri is None:
             self._finished = True
 
-        rows = self._row_mapper.map(status.rows) if self._row_mapper else status.rows
+        rows = self._row_mapper.map(cast(List[List[Any]], status.rows)) if self._row_mapper else status.rows
         self._result = TrinoResult(self, rows)
 
         # Block until rows are available, the query finishes, or it is canceled.
@@ -1040,7 +1095,7 @@ class TrinoQuery:
 
         return self._result
 
-    def _update_state(self, status):
+    def _update_state(self, status: TrinoStatus) -> None:
         self._stats.update(status.stats)
         self._update_type = status.update_type
         self._update_count = status.update_count
@@ -1057,10 +1112,12 @@ class TrinoQuery:
             # Pass a deep copy so the callback cannot mutate internal query state.
             self._stats_callback(copy.deepcopy(self._stats))
 
-    def fetch(self) -> Union[List[Union[List[Any], Any]], Iterator[List[Any]]]:
+    def fetch(self) -> Union[List[Any], Iterator[List[Any]]]:
         """Continue fetching data for the current query_id"""
+        # fetch() is only called while the query still has a next URI to poll.
+        next_uri = cast(str, self._request.next_uri)
         try:
-            response = self._request.get(self._request.next_uri)
+            response = self._request.get(next_uri)
         except requests.exceptions.RequestException as e:
             raise trino.exceptions.TrinoConnectionError("failed to fetch: {}".format(e))
         status = self._request.process(response)
@@ -1071,11 +1128,9 @@ class TrinoQuery:
         if not self._row_mapper:
             return []
 
-        rows = status.rows
         if isinstance(status.rows, dict):
             # spooling protocol
-            rows = cast(_SpooledProtocolResponseTO, rows)
-            spooled = self._to_segments(rows)
+            spooled = self._to_segments(cast(_SpooledProtocolResponseTO, status.rows))
             if self._fetch_mode == "segments":
                 return spooled
             # Return iterator directly, do NOT materialize with list()
@@ -1086,14 +1141,14 @@ class TrinoQuery:
                 heartbeat_interval=self._request._client_session.heartbeat_interval,
             )
         elif isinstance(status.rows, list):
-            return self._row_mapper.map(rows)
+            return self._row_mapper.map(cast(List[List[Any]], status.rows))
         else:
             raise ValueError(f"Unexpected type: {type(status.rows)}")
 
     def _to_segments(self, rows: _SpooledProtocolResponseTO) -> List[DecodableSegment]:
         encoding = rows["encoding"]
         metadata = rows["metadata"] if "metadata" in rows else None
-        segments = []
+        segments: List[Segment] = []
         for segment in rows["segments"]:
             segment_type = segment["type"]
             if segment_type == SegmentType.INLINE:
@@ -1143,18 +1198,26 @@ class TrinoQuery:
         return self._cancelled
 
 
-def _retry_with(handle_retry, handled_exceptions, conditions, max_attempts):
-    def wrapper(func):
+def _retry_with(
+    handle_retry: RetryHandler,
+    handled_exceptions: Tuple[Any, ...],
+    conditions: Tuple[Callable[[Any], bool], ...],
+    max_attempts: int,
+) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
+    if max_attempts < 1:
+        raise ValueError(f"max_attempts must be at least 1, got {max_attempts}")
+
+    def wrapper(func: Callable[_P, _R]) -> Callable[_P, _R]:
         @functools.wraps(func)
-        def decorated(*args, **kwargs):
-            error = None
-            result = None
+        def decorated(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+            error: Optional[BaseException] = None
+            result: Optional[_R] = None
             for attempt in range(1, max_attempts + 1):
                 try:
                     result = func(*args, **kwargs)
                     if any(guard(result) for guard in conditions):
                         if result.status_code == 429 and "Retry-After" in result.headers:
-                            retry_after = _parse_retry_after_header(result.headers.get("Retry-After"))
+                            retry_after = _parse_retry_after_header(result.headers["Retry-After"])
                             handle_retry_sleep = _RetryAfterSleep(retry_after)
                             handle_retry_sleep.retry()
                         else:
@@ -1170,14 +1233,16 @@ def _retry_with(handle_retry, handled_exceptions, conditions, max_attempts):
             logger.info("failed after %s attempts", attempt)
             if error is not None:
                 raise error
-            return result
+            # max_attempts is at least 1, so the loop ran and `result` holds the
+            # response of the last attempt, which a retry condition matched.
+            return cast("_R", result)
 
         return decorated
 
     return wrapper
 
 
-def _parse_retry_after_header(retry_after):
+def _parse_retry_after_header(retry_after: Union[int, str]) -> float:
     if isinstance(retry_after, int):
         return retry_after
     elif isinstance(retry_after, str) and retry_after.isdigit():
@@ -1234,7 +1299,7 @@ class Segment(abc.ABC):
 
     @property
     @abstractmethod
-    def data(self):
+    def data(self) -> bytes:
         pass
 
     @property
@@ -1252,13 +1317,13 @@ class InlineSegment(Segment):
     """
     def __init__(self, segment: _InlineSegmentTO) -> None:
         super().__init__(segment)
-        self._segment = cast(_InlineSegmentTO, segment)
+        self._segment: _InlineSegmentTO = segment
 
     @property
     def data(self) -> bytes:
         return base64.b64decode(self._segment["data"])
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"InlineSegment(metadata={self.metadata})"
 
 
@@ -1285,7 +1350,7 @@ class SpooledSegment(Segment):
         custom_headers: Optional[Dict[str, str]] = None,
     ) -> None:
         super().__init__(segment)
-        self._segment = cast(_SpooledSegmentTO, segment)
+        self._segment: _SpooledSegmentTO = segment
         self._request = request
         self._coordinator_host = coordinator_host
         self._custom_headers = custom_headers or {}
@@ -1310,7 +1375,7 @@ class SpooledSegment(Segment):
         return self._segment.get("headers", {})
 
     def acknowledge(self) -> None:
-        def acknowledge_request():
+        def acknowledge_request() -> None:
             try:
                 http_response = self._send_spooling_request(self.ack_uri, timeout=2)
                 if not http_response.ok:
@@ -1320,7 +1385,7 @@ class SpooledSegment(Segment):
         # Start the acknowledgment in the executor thread
         executor.submit(acknowledge_request)
 
-    def _send_spooling_request(self, uri: str, **kwargs) -> requests.Response:
+    def _send_spooling_request(self, uri: str, **kwargs: Any) -> requests.Response:
         headers: Dict[str, str] = {}
         # Forward user-supplied custom headers (e.g. auth gateway headers) only when the
         # request targets the Trino coordinator, never to external storage (e.g. S3 presigned
@@ -1334,7 +1399,7 @@ class SpooledSegment(Segment):
             headers[key] = values[0]
         return self._request._get(uri, headers=headers, **kwargs)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return (
             f"SpooledSegment(metadata={self.metadata})"
         )
@@ -1355,18 +1420,18 @@ class DecodableSegment:
         self._segment = segment
 
     @property
-    def encoding(self):
+    def encoding(self) -> str:
         return self._encoding
 
     @property
-    def segment(self):
+    def segment(self) -> Segment:
         return self._segment
 
     @property
-    def metadata(self):
+    def metadata(self) -> _SegmentMetadataTO:
         return self._metadata
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return (f"DecodableSegment(encoding={self._encoding}, metadata={self._metadata}, segment={self._segment})")
 
 
@@ -1388,7 +1453,7 @@ class _RequestHeartbeat:
         threading.Thread(target=self._run, daemon=True).start()
         return self
 
-    def __exit__(self, *_) -> None:
+    def __exit__(self, *_: Any) -> None:
         self._stop_event.set()
 
     def _run(self) -> None:
@@ -1426,14 +1491,14 @@ class SegmentIterator:
     def __init__(
         self,
         segments: Union[DecodableSegment, List[DecodableSegment]],
-        mapper: RowMapper,
+        mapper: _AnyRowMapper,
         *,
         request: Optional[TrinoRequest] = None,
         heartbeat_interval: Optional[float] = None,
     ) -> None:
         self._segments = iter(segments if isinstance(segments, List) else [segments])
         self._mapper = mapper
-        self._decoder = None
+        self._decoder: Optional[SegmentDecoder] = None
         self._rows: Iterator[List[List[Any]]] = iter([])
         self._finished = False
         self._current_segment: Optional[DecodableSegment] = None
@@ -1457,7 +1522,7 @@ class SegmentIterator:
                     raise StopIteration
                 self._load_next_segment()
 
-    def _load_next_segment(self):
+    def _load_next_segment(self) -> None:
         # A segment is acknowledged only after its rows were decoded successfully. If the previous attempt failed
         # mid-decode (e.g. the spooled segment download failed) the same segment is retried instead of being skipped.
         if self._pending_segment is None:
@@ -1495,18 +1560,14 @@ class SegmentDecoder():
         self._decoder = decoder
 
     def decode(self, segment: Segment) -> List[List[Any]]:
-        if isinstance(segment, InlineSegment):
-            inline_segment = cast(InlineSegment, segment)
-            return self._decoder.decode(inline_segment.data, inline_segment.metadata)
-        elif isinstance(segment, SpooledSegment):
-            spooled_data = cast(SpooledSegment, segment)
-            return self._decoder.decode(spooled_data.data, spooled_data.metadata)
+        if isinstance(segment, (InlineSegment, SpooledSegment)):
+            return self._decoder.decode(segment.data, segment.metadata)
         else:
             raise ValueError(f"Unsupported segment type: {type(segment)}")
 
 
 class CompressedQueryDataDecoderFactory():
-    def __init__(self, mapper: RowMapper) -> None:
+    def __init__(self, mapper: _AnyRowMapper) -> None:
         self._mapper = mapper
 
     def create(self, encoding: str) -> QueryDataDecoder:
@@ -1535,10 +1596,10 @@ class QueryDataDecoder(abc.ABC):
 
 
 class JsonQueryDataDecoder(QueryDataDecoder):
-    def __init__(self, mapper: RowMapper) -> None:
+    def __init__(self, mapper: _AnyRowMapper) -> None:
         self._mapper = mapper
 
-    def decode(self, data: bytes, metadata: Dict[str, Any]) -> List[List[Any]]:
+    def decode(self, data: bytes, metadata: _SegmentMetadataTO) -> List[List[Any]]:
         return self._mapper.map(json.loads(data.decode("utf8")))
 
 
@@ -1572,7 +1633,7 @@ class CompressedQueryDataDecoder(QueryDataDecoder):
 class ZStdQueryDataDecoder(CompressedQueryDataDecoder):
     def __init__(self, delegate: QueryDataDecoder) -> None:
         super().__init__(delegate)
-        self._decompressor = None
+        self._decompressor: Optional[zstandard.ZstdDecompressor] = None
 
     def decompress(self, data: bytes, metadata: _SegmentMetadataTO) -> bytes:
         if self._decompressor is None:

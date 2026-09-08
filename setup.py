@@ -43,6 +43,9 @@ tests_require = all_require + [
     "httpretty < 1.1",
     "pytest",
     "pytest-runner",
+    # Type stubs, so that `mypy trino/` locally matches the pre-commit hook.
+    "types-requests",
+    "types-tzlocal",
     "pre-commit",
     "black",
     "isort",

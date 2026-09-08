@@ -438,7 +438,7 @@ class _OAuth2TokenBearer(AuthBase):
         if token is not None:
             r.headers['Authorization'] = "Bearer " + token
 
-        r.register_hook('response', self._authenticate)
+        r.register_hook('response', self._authenticate)  # type: ignore[no-untyped-call]
 
         return r
 
@@ -500,8 +500,9 @@ class _OAuth2TokenBearer(AuthBase):
 
     def _retry_request(self, response: Response, **kwargs: Any) -> Optional[Response]:
         request = response.request.copy()
-        extract_cookies_to_jar(request._cookies, response.request, response.raw)
-        request.prepare_cookies(request._cookies)
+        cookies = request._cookies  # type: ignore[attr-defined]  # no `_cookies` in type stubs for `requests`
+        extract_cookies_to_jar(cookies, response.request, response.raw)  # type: ignore[no-untyped-call]
+        request.prepare_cookies(cookies)
 
         host = self._determine_host(response.request.url)
         user = self._determine_user(request.headers)

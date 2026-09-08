@@ -17,13 +17,19 @@ https://www.python.org/dev/peps/pep-0249/ .
 Fetch methods returns rows as a list of lists on purpose to let the caller
 decide to convert then to a list of tuples.
 """
+from __future__ import annotations
+
 import datetime
 import math
 import uuid
 from collections import OrderedDict
+from collections.abc import Iterator
+from collections.abc import Mapping
+from collections.abc import Sequence
 from decimal import Decimal
 from itertools import islice
 from threading import Lock
+from time import localtime
 from time import time
 from typing import Any
 from typing import Callable
@@ -31,14 +37,18 @@ from typing import Dict
 from typing import List
 from typing import NamedTuple
 from typing import Optional
+from typing import Tuple
 from typing import Union
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
+
+from requests import Session
 
 import trino.client
 import trino.exceptions
 import trino.logging
 from trino import constants
+from trino.auth import Authentication
 from trino.constants import LENGTH_TYPES
 from trino.constants import PRECISION_TYPES
 from trino.constants import SCALE_TYPES
@@ -89,13 +99,14 @@ class TimeBoundLRUCache:
     """A bounded LRU cache which expires entries after a configured number of seconds.
     Note that expired entries will be evicted only on an attempted access (or through
     the LRU policy)."""
-    def __init__(self, capacity: int, ttl_seconds: int):
+    def __init__(self, capacity: int, ttl_seconds: int) -> None:
         self.capacity = capacity
         self.ttl_seconds = ttl_seconds
-        self.cache = OrderedDict()
+        # Maps key -> (value, insertion timestamp)
+        self.cache: "OrderedDict[object, Tuple[Any, float]]" = OrderedDict()
         self.lock = Lock()
 
-    def get(self, key):
+    def get(self, key: object) -> Any:
         with self.lock:
             if key not in self.cache:
                 return None
@@ -106,21 +117,21 @@ class TimeBoundLRUCache:
             self.cache.move_to_end(key)
             return value
 
-    def put(self, key, value):
+    def put(self, key: object, value: Any) -> None:
         with self.lock:
             self.cache[key] = value, time()
             self.cache.move_to_end(key)
             if len(self.cache) > self.capacity:
                 self.cache.popitem(last=False)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"LRUCache(capacity: {self.capacity}, ttl: {self.ttl_seconds} seconds, {self.cache})"
 
 
 must_use_legacy_prepared_statements = TimeBoundLRUCache(1024, 3600)
 
 
-def connect(*args, **kwargs):
+def connect(*args: Any, **kwargs: Any) -> Connection:
     """Constructor for creating a connection to the database.
 
     See class :py:class:`Connection` for arguments.
@@ -130,7 +141,7 @@ def connect(*args, **kwargs):
     return Connection(*args, **kwargs)
 
 
-_USE_DEFAULT_ENCODING = object()
+_USE_DEFAULT_ENCODING: Any = object()
 
 
 class Connection:
@@ -144,30 +155,30 @@ class Connection:
     def __init__(
         self,
         host: str,
-        port=None,
-        user=None,
-        source=constants.DEFAULT_SOURCE,
-        catalog=constants.DEFAULT_CATALOG,
-        schema=constants.DEFAULT_SCHEMA,
-        session_properties=None,
-        http_headers=None,
-        http_scheme=None,
-        auth=constants.DEFAULT_AUTH,
-        extra_credential=None,
-        max_attempts=constants.DEFAULT_MAX_ATTEMPTS,
-        request_timeout=constants.DEFAULT_REQUEST_TIMEOUT,
-        isolation_level=IsolationLevel.AUTOCOMMIT,
-        verify=True,
-        http_session=None,
-        client_tags=None,
-        legacy_primitive_types=False,
-        legacy_prepared_statements=None,
-        roles=None,
-        timezone=None,
+        port: Optional[Union[int, str]] = None,
+        user: Optional[str] = None,
+        source: Optional[str] = constants.DEFAULT_SOURCE,
+        catalog: Optional[str] = constants.DEFAULT_CATALOG,
+        schema: Optional[str] = constants.DEFAULT_SCHEMA,
+        session_properties: Optional[Dict[str, Any]] = None,
+        http_headers: Optional[Dict[str, Union[str, bytes]]] = None,
+        http_scheme: Optional[str] = None,
+        auth: Optional[Authentication] = constants.DEFAULT_AUTH,
+        extra_credential: Optional[Sequence[Tuple[str, Any]]] = None,
+        max_attempts: int = constants.DEFAULT_MAX_ATTEMPTS,
+        request_timeout: Union[float, Tuple[float, float]] = constants.DEFAULT_REQUEST_TIMEOUT,
+        isolation_level: IsolationLevel = IsolationLevel.AUTOCOMMIT,
+        verify: Optional[Union[bool, str]] = True,
+        http_session: Optional[Session] = None,
+        client_tags: Optional[Sequence[str]] = None,
+        legacy_primitive_types: bool = False,
+        legacy_prepared_statements: Optional[bool] = None,
+        roles: Optional[Union[Mapping[str, str], str]] = None,
+        timezone: Optional[str] = None,
         encoding: Union[str, List[str]] = _USE_DEFAULT_ENCODING,
         heartbeat_interval: Optional[float] = constants.DEFAULT_HEARTBEAT_INTERVAL,
         allow_insecure_auth: bool = False,
-    ):
+    ) -> None:
         # Automatically assign http_schema, port based on hostname
         parsed_host = urlparse(host, allow_fragments=False)
 
@@ -233,9 +244,9 @@ class Connection:
         # Infer connection port: `hostname` takes precedence over explicit `port` argument
         # If none is given, use default based on HTTP protocol
         default_port = constants.DEFAULT_TLS_PORT if self.http_scheme == constants.HTTPS else constants.DEFAULT_PORT
-        self.port = (
+        self.port: int = (
             parsed_host.port if parsed_host.port is not None
-            else port if port is not None
+            else int(port) if port is not None
             else default_port
         )
 
@@ -246,23 +257,23 @@ class Connection:
         self.client_tags = client_tags
 
         self._isolation_level = isolation_level
-        self._request = None
-        self._transaction = None
+        self._request: Optional[trino.client.TrinoRequest] = None
+        self._transaction: Optional[Transaction] = None
         self.legacy_primitive_types = legacy_primitive_types
         self.legacy_prepared_statements = legacy_prepared_statements
 
     @property
-    def isolation_level(self):
+    def isolation_level(self) -> IsolationLevel:
         return self._isolation_level
 
     @property
-    def transaction(self):
+    def transaction(self) -> Optional[Transaction]:
         return self._transaction
 
-    def __enter__(self):
+    def __enter__(self) -> Connection:
         return self
 
-    def __exit__(self, exc_type, exc_value, traceback):
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
         try:
             self.commit()
         except Exception:
@@ -270,28 +281,28 @@ class Connection:
         else:
             self.close()
 
-    def close(self):
+    def close(self) -> None:
         # TODO cancel outstanding queries?
         self._http_session.close()
 
-    def start_transaction(self):
+    def start_transaction(self) -> Transaction:
         self._transaction = Transaction(self._create_request())
         self._transaction.begin()
         return self._transaction
 
-    def commit(self):
-        if self.transaction is None:
+    def commit(self) -> None:
+        if self._transaction is None:
             return
         self._transaction.commit()
         self._transaction = None
 
-    def rollback(self):
-        if self.transaction is None:
+    def rollback(self) -> None:
+        if self._transaction is None:
             raise RuntimeError("no transaction was started")
         self._transaction.rollback()
         self._transaction = None
 
-    def _create_request(self):
+    def _create_request(self) -> trino.client.TrinoRequest:
         return trino.client.TrinoRequest(
             self.host,
             self.port,
@@ -306,8 +317,8 @@ class Connection:
     def cursor(
             self,
             cursor_style: str = "row",
-            legacy_primitive_types: bool = None,
-            stats_callback: Optional[Callable[[Dict[str, Any]], None]] = None):
+            legacy_primitive_types: Optional[bool] = None,
+            stats_callback: Optional[Callable[[Dict[str, Any]], None]] = None) -> Cursor:
         """Return a new :py:class:`Cursor` object using the connection."""
         if self.isolation_level != IsolationLevel.AUTOCOMMIT:
             if self.transaction is None:
@@ -334,7 +345,7 @@ class Connection:
             stats_callback=stats_callback
         )
 
-    def _use_legacy_prepared_statements(self):
+    def _use_legacy_prepared_statements(self) -> bool:
         if self.legacy_prepared_statements is not None:
             return self.legacy_prepared_statements
 
@@ -365,21 +376,21 @@ class DescribeOutput(NamedTuple):
     aliased: bool
 
     @classmethod
-    def from_row(cls, row: List[Any]):
+    def from_row(cls, row: List[Any]) -> DescribeOutput:
         return cls(*row)
 
 
 class ColumnDescription(NamedTuple):
     name: str
     type_code: int
-    display_size: int
-    internal_size: int
-    precision: int
-    scale: int
-    null_ok: bool
+    display_size: Optional[int]
+    internal_size: Optional[int]
+    precision: Optional[int]
+    scale: Optional[int]
+    null_ok: Optional[bool]
 
     @classmethod
-    def from_column(cls, column: Dict[str, Any]):
+    def from_column(cls, column: Dict[str, Any]) -> ColumnDescription:
         type_signature = column["typeSignature"]
         raw_type = type_signature["rawType"]
         arguments = type_signature["arguments"]
@@ -404,10 +415,10 @@ class Cursor:
 
     def __init__(
             self,
-            connection,
-            request,
+            connection: Connection,
+            request: trino.client.TrinoRequest,
             legacy_primitive_types: bool = False,
-            stats_callback: Optional[Callable[[Dict[str, Any]], None]] = None):
+            stats_callback: Optional[Callable[[Dict[str, Any]], None]] = None) -> None:
         if not isinstance(connection, Connection):
             raise ValueError(
                 "connection must be a Connection object: {}".format(type(connection))
@@ -416,38 +427,42 @@ class Cursor:
         self._request = request
 
         self.arraysize = 1
-        self._iterator = None
-        self._query = None
+        self._iterator: Optional[Iterator[Any]] = None
+        self._query: Optional[trino.client.TrinoQuery] = None
         self._legacy_primitive_types = legacy_primitive_types
         self._stats_callback = stats_callback
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[Any]:
+        if self._iterator is None:
+            raise trino.exceptions.ProgrammingError(
+                "no result set to iterate over: execute() has not been called yet"
+            )
         return self._iterator
 
-    def __enter__(self):
+    def __enter__(self) -> Cursor:
         return self
 
-    def __exit__(self, exc_type, exc_value, traceback):
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
         self.close()
 
     @property
-    def connection(self):
+    def connection(self) -> Connection:
         return self._connection
 
     @property
-    def info_uri(self):
+    def info_uri(self) -> Optional[str]:
         if self._query is not None:
             return self._query.info_uri
         return None
 
     @property
-    def update_type(self):
+    def update_type(self) -> Optional[str]:
         if self._query is not None:
             return self._query.update_type
         return None
 
     @property
-    def description(self) -> List[ColumnDescription]:
+    def description(self) -> Optional[List[ColumnDescription]]:
         if self._query is None or self._query.columns is None:
             return None
 
@@ -457,7 +472,7 @@ class Cursor:
         ]
 
     @property
-    def rowcount(self):
+    def rowcount(self) -> int:
         """The rowcount will be returned for INSERT, UPDATE, DELETE, MERGE
         and CTAS statements based on `update_count` returned by the Trino
         API.
@@ -475,7 +490,7 @@ class Cursor:
         return -1
 
     @property
-    def stats(self):
+    def stats(self) -> Optional[Dict[Any, Any]]:
         if self._query is not None:
             return self._query.stats
         return None
@@ -493,15 +508,15 @@ class Cursor:
         return None
 
     @property
-    def warnings(self):
+    def warnings(self) -> Optional[List[Dict[Any, Any]]]:
         if self._query is not None:
             return self._query.warnings
         return None
 
-    def setinputsizes(self, sizes):
+    def setinputsizes(self, sizes: Any) -> None:
         raise trino.exceptions.NotSupportedError
 
-    def setoutputsize(self, size, column):
+    def setoutputsize(self, size: Any, column: Any) -> None:
         raise trino.exceptions.NotSupportedError
 
     def _prepare_statement(self, statement: str, name: str) -> None:
@@ -519,9 +534,9 @@ class Cursor:
 
     def _execute_prepared_statement(
         self,
-        statement_name,
-        params
-    ):
+        statement_name: str,
+        params: Sequence[Any],
+    ) -> trino.client.TrinoQuery:
         sql = 'EXECUTE ' + statement_name + ' USING ' + ','.join(map(self._format_prepared_param, params))
         return trino.client.TrinoQuery(
             self._request,
@@ -529,7 +544,7 @@ class Cursor:
             legacy_primitive_types=self._legacy_primitive_types,
             stats_callback=self._stats_callback)
 
-    def _execute_immediate_statement(self, statement: str, params):
+    def _execute_immediate_statement(self, statement: str, params: Sequence[Any]) -> trino.client.TrinoQuery:
         """
         Binds parameters and executes a statement in one call.
 
@@ -544,7 +559,7 @@ class Cursor:
             legacy_primitive_types=self._legacy_primitive_types,
             stats_callback=self._stats_callback)
 
-    def _format_prepared_param(self, param):
+    def _format_prepared_param(self, param: Any) -> str:
         """
         Formats parameters to be passed in an
         EXECUTE statement.
@@ -632,15 +647,13 @@ class Cursor:
                                         legacy_primitive_types=self._legacy_primitive_types)
         query.execute()
 
-    def _generate_unique_statement_name(self):
+    def _generate_unique_statement_name(self) -> str:
         return 'st_' + uuid.uuid4().hex.replace('-', '')
 
-    def execute(self, operation, params=None):
+    def execute(self, operation: str, params: Optional[Sequence[Any]] = None) -> "Cursor":
         if params:
-            assert isinstance(params, (list, tuple)), (
-                'params must be a list or tuple containing the query '
-                'parameter values'
-            )
+            if not isinstance(params, (list, tuple)):
+                raise TypeError('params must be a list or tuple containing the query parameter values')
 
             if self.connection._use_legacy_prepared_statements():
                 statement_name = self._generate_unique_statement_name()
@@ -670,7 +683,7 @@ class Cursor:
             self._iterator = iter(self._query.execute())
         return self
 
-    def executemany(self, operation, seq_of_params):
+    def executemany(self, operation: str, seq_of_params: Sequence[Sequence[Any]]) -> "Cursor":
         """
         PEP-0249: Prepare a database operation (query or command) and then
         execute it against all parameter sequences or mappings found in the sequence seq_of_parameters.
@@ -689,7 +702,7 @@ class Cursor:
         for parameters in seq_of_params[:-1]:
             self.execute(operation, parameters)
             self.fetchall()
-            if self._query.update_type is None:
+            if self.update_type is None:
                 raise NotSupportedError("Query must return update type")
         if seq_of_params:
             self.execute(operation, seq_of_params[-1])
@@ -707,15 +720,19 @@ class Cursor:
         .execute*() did not produce any result set or no call was issued yet.
         """
 
+        if self._iterator is None:
+            raise trino.exceptions.ProgrammingError(
+                "no result set to fetch from: execute() has not been called yet"
+            )
+
         try:
-            assert self._iterator is not None
             return next(self._iterator)
         except StopIteration:
             return None
         except trino.exceptions.HttpError as err:
             raise trino.exceptions.OperationalError(str(err))
 
-    def fetchmany(self, size=None) -> List[List[Any]]:
+    def fetchmany(self, size: Optional[int] = None) -> List[List[Any]]:
         """
         PEP-0249: Fetch the next set of rows of a query result, returning a
         sequence of sequences (e.g. a list of tuples). An empty sequence is
@@ -763,18 +780,22 @@ class Cursor:
 
         return list(map(lambda x: DescribeOutput.from_row(x), result))
 
-    def genall(self):
+    def genall(self) -> Any:
+        if self._query is None:
+            raise trino.exceptions.ProgrammingError(
+                "no result set to iterate over: execute() has not been called yet"
+            )
         return self._query.result
 
     def fetchall(self) -> List[List[Any]]:
         return list(iter(self.fetchone, None))
 
-    def cancel(self):
+    def cancel(self) -> None:
         if self._query is None:
             return
         self._query.cancel()
 
-    def close(self):
+    def close(self) -> None:
         self.cancel()
         # TODO: Cancel not only the last query executed on this cursor
         #  but also any other outstanding queries executed through this cursor.
@@ -783,16 +804,16 @@ class Cursor:
 class SegmentCursor(Cursor):
     def __init__(
             self,
-            connection,
-            request,
+            connection: Connection,
+            request: trino.client.TrinoRequest,
             legacy_primitive_types: bool = False,
-            stats_callback: Optional[Callable[[Dict[str, Any]], None]] = None):
+            stats_callback: Optional[Callable[[Dict[str, Any]], None]] = None) -> None:
         super().__init__(
             connection, request, legacy_primitive_types=legacy_primitive_types, stats_callback=stats_callback)
         if self.connection._client_session.encoding is None:
             raise ValueError("SegmentCursor can only be used if encoding is set on the connection")
 
-    def execute(self, operation, params=None):
+    def execute(self, operation: str, params: Optional[Sequence[Any]] = None) -> "Cursor":
         if params:
             # TODO: refactor code to allow for params to be supported
             raise ValueError("params not supported")
@@ -812,11 +833,12 @@ DateFromTicks = datetime.date.fromtimestamp
 TimestampFromTicks = datetime.datetime.fromtimestamp
 
 
-def TimeFromTicks(ticks):
-    return datetime.time(*datetime.localtime(ticks)[3:6])
+def TimeFromTicks(ticks: float) -> datetime.time:
+    local = localtime(ticks)
+    return datetime.time(local.tm_hour, local.tm_min, local.tm_sec)
 
 
-def Binary(value):
+def Binary(value: Any) -> bytes:
     if isinstance(value, (bytes, bytearray, memoryview)):
         return bytes(value)
     if isinstance(value, str):
@@ -825,10 +847,10 @@ def Binary(value):
 
 
 class DBAPITypeObject:
-    def __init__(self, *values):
+    def __init__(self, *values: str) -> None:
         self.values = [v.lower() for v in values]
 
-    def __eq__(self, other):
+    def __eq__(self, other: Any) -> bool:
         return other.lower() in self.values
 
 

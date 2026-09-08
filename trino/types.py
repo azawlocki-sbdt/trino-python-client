@@ -6,7 +6,6 @@ from datetime import time
 from datetime import timedelta
 from decimal import Decimal
 from typing import Any
-from typing import cast
 from typing import Dict
 from typing import Generic
 from typing import List
@@ -100,7 +99,7 @@ class TimestampWithTimeZone(Timestamp, TemporalType[datetime]):
 class NamedRowTuple(Tuple[Any, ...]):
     """Custom tuple class as namedtuple doesn't support missing or duplicate names"""
     def __new__(cls, values: List[Any], names: List[str], types: List[str]) -> NamedRowTuple:
-        return cast(NamedRowTuple, super().__new__(cls, values))
+        return super().__new__(cls, values)
 
     def __init__(self, values: List[Any], names: List[Optional[str]], types: List[str]):
         self._names = names

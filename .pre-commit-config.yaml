@@ -10,6 +10,12 @@ repos:
     hooks:
       - id: "mypy"
         name: "Python: types"
+        # The hook runs in an isolated environment, so the stubs for the
+        # third-party libraries used in annotated modules must be installed
+        # explicitly, otherwise they resolve to Any and are not checked.
+        additional_dependencies:
+          - "types-requests"
+          - "types-tzlocal"
 
   - repo: "https://github.com/asottile/reorder-python-imports"
     rev: "v3.14.0"

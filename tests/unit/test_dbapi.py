@@ -9,6 +9,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import datetime
 import json
 import threading
 import uuid
@@ -35,6 +36,7 @@ from trino.dbapi import Binary
 from trino.dbapi import connect
 from trino.dbapi import Connection
 from trino.dbapi import Cursor
+from trino.dbapi import TimeFromTicks
 
 
 @patch("trino.dbapi.trino.client")
@@ -545,3 +547,32 @@ def test_format_prepared_param_binary(value, expected):
     assert cursor._format_prepared_param(value) == expected
     # Round trip through Binary(), as SQLAlchemy's _Binary.bind_processor does.
     assert cursor._format_prepared_param(Binary(value)) == expected
+
+
+def test_time_from_ticks():
+    """The PEP 249 constructor builds a local time from a Unix timestamp; it used to
+    call a function that does not exist on the datetime module.
+    """
+    ticks = 1700000000
+    expected = datetime.datetime.fromtimestamp(ticks).time().replace(microsecond=0)
+    assert TimeFromTicks(ticks) == expected
+
+
+@pytest.mark.parametrize(
+    "consume",
+    [
+        pytest.param(lambda cursor: iter(cursor), id="iter"),
+        pytest.param(lambda cursor: cursor.fetchone(), id="fetchone"),
+        pytest.param(lambda cursor: cursor.fetchmany(), id="fetchmany"),
+        pytest.param(lambda cursor: cursor.fetchall(), id="fetchall"),
+        pytest.param(lambda cursor: cursor.genall(), id="genall"),
+    ]
+)
+def test_consuming_cursor_without_execute_raises_programming_error(consume):
+    """PEP 249 requires an Error subclass when no execute() produced a result set."""
+    cursor = Cursor.__new__(Cursor)
+    cursor._iterator = None
+    cursor._query = None
+    cursor.arraysize = 1
+    with pytest.raises(trino.exceptions.ProgrammingError, match="execute\\(\\) has not been called"):
+        consume(cursor)

@@ -280,6 +280,7 @@ class Connection:
                 cursor.close()
             except Exception as e:
                 logger.warning("Failed to close a cursor while closing the connection: %s", e)
+        trino.client.close_heartbeats(self._http_session)
         self._http_session.close()
 
     def start_transaction(self):

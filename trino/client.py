@@ -47,6 +47,7 @@ import re
 import threading
 import urllib.parse
 import warnings
+import weakref
 from abc import abstractmethod
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -125,6 +126,86 @@ def close_executor():
 
 
 atexit.register(close_executor)
+
+
+class _ExclusiveWorker:
+    """
+    Splits work on one resource into foreground and background, separated by a mutex.
+
+    `in_foreground` wraps a callable so that calling it occupies the resource: it waits for the
+    mutex, so foreground calls serialize against each other and always run. `run_in_background`
+    runs a task on a single dedicated thread rather than the caller's, and drops it when the
+    resource is occupied on its turn, since whoever holds it is already using it.
+
+    The motivation was to serialize access to a requests.Session and providing a background thread
+    to make HEAD requests.
+    """
+
+    def __init__(self, thread_name_prefix: str) -> None:
+        self._lock = threading.Lock()
+        self._thread_name_prefix = thread_name_prefix
+        self._executor: Optional[ThreadPoolExecutor] = None
+        self._executor_lock = threading.Lock()
+        self._closed = False
+
+    def in_foreground(self, func: Callable[..., Any]) -> Callable[..., Any]:
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            with self._lock:
+                return func(*args, **kwargs)
+
+        return wrapper
+
+    def run_in_background(self, func: Callable[[], None]) -> None:
+        with self._executor_lock:
+            if self._closed:
+                return
+            if self._executor is None:
+                self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=self._thread_name_prefix)
+            self._executor.submit(self._run_if_free, func)
+
+    def _run_if_free(self, func: Callable[[], None]) -> None:
+        if not self._lock.acquire(blocking=False):
+            return
+        try:
+            func()
+        finally:
+            self._lock.release()
+
+    def close(self) -> None:
+        with self._executor_lock:
+            self._closed = True
+            executor, self._executor = self._executor, None
+        if executor is not None:
+            # Work in flight must not delay closing the resource this worker serves.
+            executor.shutdown(wait=False, cancel_futures=True)
+
+
+_session_workers: "weakref.WeakKeyDictionary[Session, _ExclusiveWorker]" = weakref.WeakKeyDictionary()
+_session_workers_lock = threading.Lock()
+
+
+def _worker_for_session(http_session: Session) -> _ExclusiveWorker:
+    # A requests.Session is not thread safe, and its auth handler holds state shared by every
+    # request made through it (an OAuth2 token bearer, a GSSAPI security context), so all
+    # traffic on one Session takes that Session's lock.
+    #
+    # Keyed on the Session, not on TrinoRequest: one Connection hands the same Session to a
+    # TrinoRequest per cursor and per transaction, and those must share one lock.
+    with _session_workers_lock:
+        worker = _session_workers.get(http_session)
+        if worker is None:
+            worker = _ExclusiveWorker(thread_name_prefix="trino-heartbeat")
+            _session_workers[http_session] = worker
+        return worker
+
+
+def close_heartbeats(http_session: Session) -> None:
+    """Stop the heartbeat thread serving `http_session`, if one was ever started."""
+    with _session_workers_lock:
+        worker = _session_workers.get(http_session)
+    if worker is not None:
+        worker.close()
+
 
 MAX_ATTEMPTS = constants.DEFAULT_MAX_ATTEMPTS
 SOCKS_PROXY = os.environ.get("SOCKS_PROXY")
@@ -522,6 +603,7 @@ class TrinoRequest:
         else:
             self._http_session = self.http.Session()
             self._http_session.verify = verify
+        self._session_worker = _worker_for_session(self._http_session)
         self._http_session.headers.update(self.http_headers)
         self._exceptions = self.HTTP_EXCEPTIONS
         self._auth = auth
@@ -638,9 +720,9 @@ class TrinoRequest:
     def max_attempts(self, value: int) -> None:
         self._max_attempts = value
         if value == 1:  # No retry
-            self._get = self._http_session.get
-            self._post = self._http_session.post
-            self._delete = self._http_session.delete
+            self._get = self._session_worker.in_foreground(self._http_session.get)
+            self._post = self._session_worker.in_foreground(self._http_session.post)
+            self._delete = self._session_worker.in_foreground(self._http_session.delete)
             return
 
         with_retry = _retry_with(
@@ -656,9 +738,11 @@ class TrinoRequest:
             ),
             max_attempts=self._max_attempts,
         )
-        self._get = with_retry(self._http_session.get)
-        self._post = with_retry(self._http_session.post)
-        self._delete = with_retry(self._http_session.delete)
+        # Take the lock inside the retry wrapper so the backoff sleep between attempts,
+        # which can reach max_delay, does not hold it.
+        self._get = with_retry(self._session_worker.in_foreground(self._http_session.get))
+        self._post = with_retry(self._session_worker.in_foreground(self._http_session.post))
+        self._delete = with_retry(self._session_worker.in_foreground(self._http_session.delete))
 
     def get_url(self, path: str) -> str:
         return "{protocol}://{host}:{port}{path}".format(
@@ -707,6 +791,9 @@ class TrinoRequest:
         return self._delete(url, timeout=self._request_timeout, proxies=PROXIES)
 
     def _head(self, url: str, timeout: Union[float, Tuple[float, float]]) -> Response:
+        # Does not go through in_foreground(): the only caller is _Heartbeat, whose beats
+        # run as background work on the session worker.
+        #
         # requests disables redirect-following for HEAD by default. Follow them so a
         # heartbeat behind a redirecting gateway still reaches the coordinator (like
         # the Java client where OkHttp follows redirects).
@@ -902,11 +989,13 @@ class _Heartbeat:
     """
 
     MAX_FAILURES = 3
-    # Upper bound on a single heartbeat HEAD since it blocks the caller's row loop.
+    # Upper bound on a single heartbeat HEAD. It runs off the caller's thread but still
+    # holds the session lock while in flight, which delays the next fetch.
     HEAD_TIMEOUT_CAP = 5.0
 
     def __init__(self, request: TrinoRequest, interval: Optional[float]) -> None:
         self._request = request
+        self._worker = request._session_worker
         # An interval of 0 disables heartbeats, same as None.
         self._interval = interval
         # Deadline for the next heartbeat. math.inf means heartbeats are disabled.
@@ -926,8 +1015,16 @@ class _Heartbeat:
             self._deadline = monotonic() + self._interval
 
     def beat(self, next_uri: str) -> None:
-        # Send one heartbeat HEAD to next_uri. The caller checks that a beat is due.
+        # Hand the HEAD to the session worker so it never stalls the caller's row loop. The
+        # worker drops the beat if other traffic holds the session, since a request in
+        # flight already renews the server-side deadline.
+        #
+        # Defer here, on the caller's thread: a beat that is still queued must not leave
+        # the deadline in the past, or every row served until it runs queues another one.
         self.defer()
+        self._worker.run_in_background(lambda: self._send(next_uri))
+
+    def _send(self, next_uri: str) -> None:
         try:
             response = self._request._head(next_uri, self._head_timeout)
         except Exception:

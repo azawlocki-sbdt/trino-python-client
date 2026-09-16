@@ -53,6 +53,7 @@ from trino.client import _Heartbeat
 from trino.client import _retry_with
 from trino.client import _RetryWithExponentialBackoff
 from trino.client import ClientSession
+from trino.client import close_heartbeats
 from trino.client import CompressedQueryDataDecoderFactory
 from trino.client import TrinoQuery
 from trino.client import TrinoRequest
@@ -1339,11 +1340,25 @@ def _scripted_query(responses, next_uri=_HEARTBEAT_NEXT_URI):
     return query, req
 
 
+def _drain_heartbeats(query):
+    """Wait for any queued beat to finish on the heartbeat thread."""
+    executor = query._heartbeat._worker._executor
+    if executor is not None:
+        # The executor has a single worker, so this runs only once the beat is done.
+        executor.submit(lambda: None).result(timeout=10)
+
+
+def _beat(query):
+    """Run a due heartbeat and wait for the heartbeat thread to finish it."""
+    query._maybe_heartbeat()
+    _drain_heartbeats(query)
+
+
 def test_heartbeat_sends_head_to_next_uri_and_reschedules():
     query, req = _scripted_query([200])
     query._heartbeat._deadline = 0.0
 
-    query._maybe_heartbeat()
+    _beat(query)
 
     assert req.head_calls == [_HEARTBEAT_NEXT_URI]
     assert req.head_timeouts == [(_Heartbeat.HEAD_TIMEOUT_CAP, _Heartbeat.HEAD_TIMEOUT_CAP)]
@@ -1367,13 +1382,13 @@ def test_gone_or_unsupported_response_disables_heartbeats(status_code):
     query, req = _scripted_query([status_code])
     query._heartbeat._deadline = 0.0
 
-    query._maybe_heartbeat()
+    _beat(query)
 
     assert req.head_calls == [_HEARTBEAT_NEXT_URI]
     assert query._heartbeat._deadline == math.inf
 
     # A disabled deadline is at math.inf so a later call is never due again on its own
-    query._maybe_heartbeat()
+    _beat(query)
 
     assert req.head_calls == [_HEARTBEAT_NEXT_URI]
 
@@ -1384,12 +1399,12 @@ def test_heartbeat_disables_after_max_consecutive_failures():
 
     for _ in range(max_failures):
         query._heartbeat._deadline = 0.0
-        query._maybe_heartbeat()
+        _beat(query)
 
     assert len(req.head_calls) == max_failures
     assert query._heartbeat._deadline == math.inf
 
-    query._maybe_heartbeat()
+    _beat(query)
 
     assert len(req.head_calls) == max_failures
 
@@ -1401,7 +1416,7 @@ def test_heartbeat_success_resets_the_failure_counter():
 
     for _ in range(len(responses)):
         query._heartbeat._deadline = 0.0
-        query._maybe_heartbeat()
+        _beat(query)
 
     assert len(req.head_calls) == len(responses)
     assert query._heartbeat._deadline == math.inf
@@ -1415,7 +1430,7 @@ def test_heartbeat_error_response_resets_the_failure_counter():
 
     for _ in range(len(responses)):
         query._heartbeat._deadline = 0.0
-        query._maybe_heartbeat()
+        _beat(query)
 
     assert len(req.head_calls) == len(responses)
     assert query._heartbeat._deadline < math.inf
@@ -1425,7 +1440,7 @@ def test_heartbeat_skips_when_next_uri_is_none():
     query, req = _scripted_query([], next_uri=None)
     query._heartbeat._deadline = 0.0
 
-    query._maybe_heartbeat()
+    _beat(query)
 
     assert req.head_calls == []
 
@@ -1435,7 +1450,7 @@ def test_heartbeat_skips_when_the_query_is_finished():
     query._finished = True
     query._heartbeat._deadline = 0.0
 
-    query._maybe_heartbeat()
+    _beat(query)
 
     assert req.head_calls == []
 
@@ -1532,7 +1547,84 @@ def test_heartbeat_sends_nothing_after_cancel():
 
     query.cancel()
     query._heartbeat._deadline = 0.0
+    _beat(query)
+
+    assert req.head_calls == []
+
+
+class _BlockingHeadRequest(_FakeHeartbeatRequest):
+    """Holds every heartbeat HEAD open until the test releases it."""
+
+    def __init__(self):
+        super().__init__(ClientSession(user="test"))
+        self.head_started = threading.Event()
+        self.release_head = threading.Event()
+
+    def _head(self, url, timeout):
+        self.head_calls.append(url)
+        self.head_started.set()
+        self.release_head.wait(timeout=10)
+        return self._canned_response(None)
+
+
+def _blocking_query():
+    req = _BlockingHeadRequest()
+    query = TrinoQuery(req, query="SELECT 1")
+    query._next_uri = _HEARTBEAT_NEXT_URI
+    query._heartbeat._deadline = 0.0
+    return query, req
+
+
+def test_heartbeat_does_not_block_the_caller():
+    query, req = _blocking_query()
+
     query._maybe_heartbeat()
+
+    # _maybe_heartbeat returned while the HEAD is still open on the heartbeat thread,
+    # so a slow beat never stalls the row loop that triggered it.
+    assert req.head_started.wait(timeout=10)
+    assert not req.release_head.is_set()
+
+    req.release_head.set()
+    _drain_heartbeats(query)
+
+
+def test_a_queued_beat_does_not_queue_another():
+    # beat() defers the deadline on the caller's thread, so rows served while a beat is
+    # still in flight find it no longer due and do not pile up more work on the executor.
+    query, req = _blocking_query()
+
+    query._maybe_heartbeat()
+    assert req.head_started.wait(timeout=10)
+    for _ in range(10):
+        query._maybe_heartbeat()
+
+    req.release_head.set()
+    _drain_heartbeats(query)
+
+    assert req.head_calls == [_HEARTBEAT_NEXT_URI]
+
+
+def test_heartbeat_skips_when_other_traffic_holds_the_session():
+    # A request in flight already renews the server-side deadline, so the beat is dropped
+    # rather than queued behind it.
+    query, req = _scripted_query([200])
+    query._heartbeat._deadline = 0.0
+
+    with query._heartbeat._worker._lock:
+        _beat(query)
+
+    assert req.head_calls == []
+    # The deadline still moved, so the skipped beat is retried a full interval later
+    assert time.monotonic() < query._heartbeat._deadline
+
+
+def test_closing_heartbeats_stops_further_beats():
+    query, req = _scripted_query([200])
+    query._heartbeat._deadline = 0.0
+
+    close_heartbeats(req._http_session)
+    _beat(query)
 
     assert req.head_calls == []
 
